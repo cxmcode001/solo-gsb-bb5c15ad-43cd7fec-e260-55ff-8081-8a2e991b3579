@@ -242,6 +242,63 @@ class SubmissionResult(BaseModel):
     edges_upserted: List[int]
 
 
+# ---------- 证书修订历史输出 ----------
+
+class CertificateRevisionOut(BaseModel):
+    """证书的一个修订版本（含该版本完整业务字段快照）。"""
+
+    certificate_id: str
+    version: int = Field(..., description="连续版本号，首次保存为 v1")
+    backfilled: bool = Field(
+        ...,
+        description=(
+            "是否为存量证书在版本功能上线后首次更新前补录的旧值 v1"
+        ),
+    )
+    created_at: datetime = Field(..., description="该版本写入时刻（UTC）")
+    snapshot: dict = Field(
+        ..., description="该版本证书的完整业务字段快照（规范化 JSON 反序列化）"
+    )
+
+
+class CertificateRevisionList(BaseModel):
+    """按证书 ID 查询到的全部修订版本（版本号升序）。"""
+
+    certificate_id: str
+    revision_count: int
+    latest_version: Optional[int] = Field(
+        None, description="最新版本号；尚无任何版本（理论上不会出现）时为 null"
+    )
+    revisions: List[CertificateRevisionOut] = Field(default_factory=list)
+
+
+class RevisionFieldChange(BaseModel):
+    """两版之间单个业务字段的取值差异。"""
+
+    field: str
+    from_value: Optional[object] = None
+    to_value: Optional[object] = None
+
+
+class CertificateRevisionDiff(BaseModel):
+    """指定两版证书之间的逐字段差异。"""
+
+    certificate_id: str
+    from_version: int
+    to_version: int
+    reversed: bool = Field(
+        ...,
+        description="请求的 from_version 是否晚于 to_version（差异仍逐字段给出）",
+    )
+    changed: bool = Field(..., description="两版业务字段是否存在差异")
+    change_count: int
+    changes: List[RevisionFieldChange] = Field(
+        default_factory=list, description="发生变化的字段（按字段名排序）"
+    )
+    from_revision: CertificateRevisionOut
+    to_revision: CertificateRevisionOut
+
+
 class PreflightIssue(BaseModel):
     """预检发现的单条错误/警告，可精确定位到提交载荷中的字段路径。"""
 

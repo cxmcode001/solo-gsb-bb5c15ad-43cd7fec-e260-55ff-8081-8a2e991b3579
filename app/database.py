@@ -73,6 +73,24 @@ CREATE TABLE IF NOT EXISTS calibration_bookings (
 
 CREATE INDEX IF NOT EXISTS idx_booking_instrument ON calibration_bookings(instrument_code);
 CREATE INDEX IF NOT EXISTS idx_booking_interval ON calibration_bookings(start_at, end_at);
+
+-- 证书修订历史：证书首次按 ID 写入时保存完整快照为 v1；存量证书在版本功能
+-- 上线后的首次更新前先补录其旧值（backfilled=1），仅当实际业务字段变化时
+-- 才追加连续新版本（同内容重交不增版）。版本写入与证书更新在同一事务内
+-- 提交，任一失败整体回滚。snapshot 为该版本全部业务字段（不含 created_at）
+-- 的规范化 JSON，日后任意两版可逐字段比对差异。
+CREATE TABLE IF NOT EXISTS certificate_revisions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    certificate_id   TEXT NOT NULL,
+    version          INTEGER NOT NULL,
+    snapshot         TEXT NOT NULL,
+    backfilled       INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    UNIQUE(certificate_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_revision_cert
+    ON certificate_revisions(certificate_id, version);
 """
 
 

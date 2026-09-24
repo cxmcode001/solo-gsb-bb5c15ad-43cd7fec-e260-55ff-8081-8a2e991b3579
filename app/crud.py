@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Optional
 
+from . import revisions
 from .schemas import CertificateIn, InstrumentIn, TraceEdgeIn
 from .utils import (
     canonical_payload,
@@ -59,22 +60,14 @@ def list_instruments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 # ---------- 证书 ----------
 
-def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
-    inst = get_instrument(conn, cert.instrument_code)
-    if inst is None:
-        raise ValidationError(f"仪器不存在: {cert.instrument_code}（请先提交仪器）")
+def _insert_certificate_row(
+    conn: sqlite3.Connection, values: dict[str, Any], created_at: str
+) -> None:
+    """证书行的底层 upsert（单条提交与批量提交共用）。
 
-    d = cert.normalized()
-    if not d["valid_from"] <= d["valid_until"]:
-        raise ValidationError(
-            f"证书 {cert.id} 的 valid_from 必须不晚于 valid_until"
-        )
-
-    payload = d["signed_payload"]
-    if payload is None:
-        payload = canonical_payload(d)
-    digest = d["signature_digest"] or compute_digest(payload, d["digest_alg"])
-
+    仅写 certificates 表本身；修订历史由调用方在**同一事务**内通过
+    ``revisions.record_certificate_write`` 记账，保证两者同成同败。
+    """
     conn.execute(
         """
         INSERT INTO certificates(id, instrument_code, cert_number, issued_at,
@@ -96,12 +89,40 @@ def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
             signature_digest=excluded.signature_digest,
             signed_payload=excluded.signed_payload
         """,
-        {
-            **d,
-            "signed_payload": payload,
-            "signature_digest": digest,
-            "created_at": utcnow_str(),
-        },
+        {**values, "created_at": created_at},
+    )
+
+
+def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
+    inst = get_instrument(conn, cert.instrument_code)
+    if inst is None:
+        raise ValidationError(f"仪器不存在: {cert.instrument_code}（请先提交仪器）")
+
+    d = cert.normalized()
+    if not d["valid_from"] <= d["valid_until"]:
+        raise ValidationError(
+            f"证书 {cert.id} 的 valid_from 必须不晚于 valid_until"
+        )
+
+    payload = d["signed_payload"]
+    if payload is None:
+        payload = canonical_payload(d)
+    digest = d["signature_digest"] or compute_digest(payload, d["digest_alg"])
+
+    values = {**d, "signed_payload": payload, "signature_digest": digest}
+    created_at = utcnow_str()
+
+    # 修订记账与证书行更新处于同一事务：先读取写入前旧值（含存量证书
+    # 首次更新前补录旧值的判定依据），再写证书行，最后按业务字段是否
+    # 实际变化决定追加版本；任一步失败由外层事务整体回滚。
+    existing = get_certificate(conn, cert.id)
+    _insert_certificate_row(conn, values, created_at)
+    revisions.record_certificate_write(
+        conn,
+        cert.id,
+        revisions.canonical_snapshot(values),
+        existing,
+        created_at=created_at,
     )
     return cert.id
 
@@ -319,33 +340,12 @@ def preflight(
         if blocking:
             continue
         payload, digest, _ = _cert_digest_info(cert)
-        conn.execute(
-            """
-            INSERT INTO certificates(id, instrument_code, cert_number, issued_at,
-                                     valid_from, valid_until, uncertainty, unit,
-                                     digest_alg, signature_digest, signed_payload,
-                                     created_at)
-            VALUES (:id, :instrument_code, :cert_number, :issued_at,
-                    :valid_from, :valid_until, :uncertainty, :unit,
-                    :digest_alg, :signature_digest, :signed_payload, :created_at)
-            ON CONFLICT(id) DO UPDATE SET
-                instrument_code=excluded.instrument_code,
-                cert_number=excluded.cert_number,
-                issued_at=excluded.issued_at,
-                valid_from=excluded.valid_from,
-                valid_until=excluded.valid_until,
-                uncertainty=excluded.uncertainty,
-                unit=excluded.unit,
-                digest_alg=excluded.digest_alg,
-                signature_digest=excluded.signature_digest,
-                signed_payload=excluded.signed_payload
-            """,
-            {
-                **d,
-                "signed_payload": payload,
-                "signature_digest": digest,
-                "created_at": utcnow_str(),
-            },
+        # 预检只模拟证书行 upsert 本身，刻意不写修订历史（预检不得留下
+        # 版本）；整个事务随后也会整体回滚。
+        _insert_certificate_row(
+            conn,
+            {**d, "signed_payload": payload, "signature_digest": digest},
+            utcnow_str(),
         )
         cert_ok += 1
 
@@ -478,9 +478,11 @@ def reset(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         DELETE FROM calibration_bookings;
+        DELETE FROM certificate_revisions;
         DELETE FROM trace_edges;
         DELETE FROM certificates;
         DELETE FROM instruments;
         DELETE FROM sqlite_sequence WHERE name='trace_edges';
+        DELETE FROM sqlite_sequence WHERE name='certificate_revisions';
         """
     )

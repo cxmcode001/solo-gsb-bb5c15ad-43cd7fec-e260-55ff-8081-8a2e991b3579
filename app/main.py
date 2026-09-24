@@ -19,6 +19,7 @@ from .routers import (
     edges,
     export,
     instruments,
+    revisions,
     submissions,
     trace,
 )
@@ -85,6 +86,7 @@ async def request_validation_exception_handler(
 
 app.include_router(instruments.router)
 app.include_router(certificates.router)
+app.include_router(revisions.router)
 app.include_router(edges.router)
 app.include_router(submissions.router)
 app.include_router(trace.router)
@@ -110,6 +112,14 @@ def root():
             "batch_submission": "POST /api/submissions",
             "batch_submission_preflight": (
                 "POST /api/submissions/preflight（dry-run，不写库）"
+            ),
+            "certificate_revisions": (
+                "GET /api/certificates/{id}/revisions"
+                "（证书修订版本列表）"
+            ),
+            "certificate_revision_diff": (
+                "GET /api/certificates/{id}/revisions/diff?from=&to="
+                "（指定两版字段差异）"
             ),
             "certificate_deactivation_impact": (
                 "POST /api/assessments/certificate-deactivation"
