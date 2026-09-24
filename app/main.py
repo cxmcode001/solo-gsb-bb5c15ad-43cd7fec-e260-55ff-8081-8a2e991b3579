@@ -111,6 +111,14 @@ def root():
             "batch_submission_preflight": (
                 "POST /api/submissions/preflight（dry-run，不写库）"
             ),
+            "certificate_revision_history": (
+                "GET /api/certificates/{id}/revisions"
+                "（首次保存为 v1，业务字段变化才追加连续版本）"
+            ),
+            "certificate_revision_diff": (
+                "GET /api/certificates/{id}/revisions/diff"
+                "?from_version=&to_version=（缺失版本 404）"
+            ),
             "certificate_deactivation_impact": (
                 "POST /api/assessments/certificate-deactivation"
             ),

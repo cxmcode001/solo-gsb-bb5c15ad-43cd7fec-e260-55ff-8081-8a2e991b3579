@@ -59,6 +59,73 @@ def list_instruments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 # ---------- 证书 ----------
 
+#: 参与“是否发生变化”判定并随版本快照保存的证书业务字段
+#: （不含 created_at 等服务端维护字段）
+CERT_BUSINESS_FIELDS = (
+    "instrument_code", "cert_number", "issued_at", "valid_from",
+    "valid_until", "uncertainty", "unit", "digest_alg",
+    "signature_digest", "signed_payload",
+)
+
+
+def _insert_certificate_revision(
+    conn: sqlite3.Connection,
+    cert_id: str,
+    version: int,
+    values: Any,
+    recorded_at: str,
+) -> None:
+    """写入一个版本快照（``values`` 可为 sqlite3.Row 或 dict）。"""
+    conn.execute(
+        """
+        INSERT INTO certificate_revisions(
+            certificate_id, version, instrument_code, cert_number,
+            issued_at, valid_from, valid_until, uncertainty, unit,
+            digest_alg, signature_digest, signed_payload, recorded_at)
+        VALUES (:certificate_id, :version, :instrument_code, :cert_number,
+                :issued_at, :valid_from, :valid_until, :uncertainty, :unit,
+                :digest_alg, :signature_digest, :signed_payload, :recorded_at)
+        """,
+        {
+            "certificate_id": cert_id,
+            "version": version,
+            **{k: values[k] for k in CERT_BUSINESS_FIELDS},
+            "recorded_at": recorded_at,
+        },
+    )
+
+
+def _record_certificate_revision(
+    conn: sqlite3.Connection,
+    cert_id: str,
+    old: Optional[sqlite3.Row],
+    new_values: dict[str, Any],
+) -> None:
+    """在证书 upsert 的同一事务内维护连续版本历史。
+
+    * 首次写入：完整快照记为 v1；
+    * 存量证书（库中已有行但尚无版本，功能上线前写入的）首次更新前，
+      先把旧值补录为 v1；
+    * 仅当业务字段实际变化时才追加连续版本 vN+1，同内容重交不增版。
+    """
+    now = utcnow_str()
+    if old is None:
+        _insert_certificate_revision(conn, cert_id, 1, new_values, now)
+        return
+    row = conn.execute(
+        "SELECT MAX(version) AS v FROM certificate_revisions"
+        " WHERE certificate_id = ?",
+        (cert_id,),
+    ).fetchone()
+    max_version = row["v"]
+    if max_version is None:
+        # 存量证书首次更新：先补录旧值为 v1
+        _insert_certificate_revision(conn, cert_id, 1, old, now)
+        max_version = 1
+    if any(old[k] != new_values[k] for k in CERT_BUSINESS_FIELDS):
+        _insert_certificate_revision(conn, cert_id, max_version + 1, new_values, now)
+
+
 def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
     inst = get_instrument(conn, cert.instrument_code)
     if inst is None:
@@ -75,6 +142,14 @@ def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
         payload = canonical_payload(d)
     digest = d["signature_digest"] or compute_digest(payload, d["digest_alg"])
 
+    new_values = {
+        **d,
+        "signed_payload": payload,
+        "signature_digest": digest,
+        "created_at": utcnow_str(),
+    }
+    # 版本历史与证书更新同一事务：先取旧行，upsert 后按业务字段比对追加版本
+    old = get_certificate(conn, cert.id)
     conn.execute(
         """
         INSERT INTO certificates(id, instrument_code, cert_number, issued_at,
@@ -96,13 +171,9 @@ def upsert_certificate(conn: sqlite3.Connection, cert: CertificateIn) -> str:
             signature_digest=excluded.signature_digest,
             signed_payload=excluded.signed_payload
         """,
-        {
-            **d,
-            "signed_payload": payload,
-            "signature_digest": digest,
-            "created_at": utcnow_str(),
-        },
+        new_values,
     )
+    _record_certificate_revision(conn, cert.id, old, new_values)
     return cert.id
 
 
@@ -123,6 +194,28 @@ def list_certificates(
     return conn.execute(
         "SELECT * FROM certificates ORDER BY instrument_code, valid_from"
     ).fetchall()
+
+
+# ---------- 证书修订历史 ----------
+
+def list_certificate_revisions(
+    conn: sqlite3.Connection, cert_id: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM certificate_revisions WHERE certificate_id = ?"
+        " ORDER BY version",
+        (cert_id,),
+    ).fetchall()
+
+
+def get_certificate_revision(
+    conn: sqlite3.Connection, cert_id: str, version: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM certificate_revisions"
+        " WHERE certificate_id = ? AND version = ?",
+        (cert_id, version),
+    ).fetchone()
 
 
 # ---------- 溯源边 ----------
@@ -479,6 +572,7 @@ def reset(conn: sqlite3.Connection) -> None:
         """
         DELETE FROM calibration_bookings;
         DELETE FROM trace_edges;
+        DELETE FROM certificate_revisions;
         DELETE FROM certificates;
         DELETE FROM instruments;
         DELETE FROM sqlite_sequence WHERE name='trace_edges';

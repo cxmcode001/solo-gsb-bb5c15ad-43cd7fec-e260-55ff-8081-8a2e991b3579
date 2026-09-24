@@ -41,6 +41,26 @@ CREATE TABLE IF NOT EXISTS certificates (
 CREATE INDEX IF NOT EXISTS idx_cert_instrument ON certificates(instrument_code);
 CREATE INDEX IF NOT EXISTS idx_cert_interval ON certificates(valid_from, valid_until);
 
+-- 证书修订历史：按 ID 写入证书时在同一事务内维护的连续版本快照。
+-- 首次保存记 v1；功能上线前已存在的存量证书首次更新前先补录旧值为 v1；
+-- 仅业务字段实际变化才追加连续版本，同内容重交不增版。
+CREATE TABLE IF NOT EXISTS certificate_revisions (
+    certificate_id   TEXT NOT NULL REFERENCES certificates(id),
+    version          INTEGER NOT NULL,
+    instrument_code  TEXT NOT NULL,
+    cert_number      TEXT NOT NULL,
+    issued_at        TEXT NOT NULL,
+    valid_from       TEXT NOT NULL,
+    valid_until      TEXT NOT NULL,
+    uncertainty      REAL NOT NULL,
+    unit             TEXT NOT NULL DEFAULT '',
+    digest_alg       TEXT NOT NULL DEFAULT 'sha256',
+    signature_digest TEXT NOT NULL,
+    signed_payload   TEXT NOT NULL,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (certificate_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS trace_edges (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     child_cert_id    TEXT NOT NULL REFERENCES certificates(id),

@@ -236,6 +236,44 @@ class TraceEdgeOut(BaseModel):
     note: str
 
 
+# ---------- 证书修订历史输出 ----------
+
+class CertificateRevisionOut(BaseModel):
+    """证书某一版本的完整业务字段快照。"""
+
+    certificate_id: str
+    version: int = Field(..., ge=1, description="连续版本号，首次保存为 1")
+    instrument_code: str
+    cert_number: str
+    issued_at: datetime
+    valid_from: datetime
+    valid_until: datetime
+    uncertainty: float
+    unit: str
+    digest_alg: str
+    signature_digest: str
+    signed_payload: str
+    recorded_at: datetime = Field(..., description="该版本被记录的时刻（UTC）")
+
+
+class CertificateRevisionListOut(BaseModel):
+    certificate_id: str
+    revision_count: int
+    revisions: List[CertificateRevisionOut]
+
+
+class CertificateRevisionDiffOut(BaseModel):
+    certificate_id: str
+    from_version: int
+    to_version: int
+    changed_fields: List[str] = Field(
+        ..., description="两版之间发生变化的业务字段（按固定字段序列出）"
+    )
+    changes: dict = Field(
+        ..., description='逐字段差异：{字段: {"from": 旧值, "to": 新值}}'
+    )
+
+
 class SubmissionResult(BaseModel):
     instruments_upserted: List[str]
     certificates_upserted: List[str]

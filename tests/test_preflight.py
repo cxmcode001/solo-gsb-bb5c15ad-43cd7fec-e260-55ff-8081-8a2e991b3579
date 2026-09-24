@@ -210,5 +210,11 @@ def test_preflight_sees_existing_db_rows_and_real_submit_still_works(client):
     assert data["would_upsert"] == {
         "instruments": 0, "certificates": 3, "edges": 2, "total": 5
     }
-    # 预检未替用户写入证书：链路查询仍应断裂（无起点证书）
-    assert client.get(f"/api/trace/W?at={AT}").status_code == 404
+    # 预检未替用户写入证书：仪器存在但仍无证书，链路查询保持断裂
+    # （仪器存在时返回 200 的 broken 报告，404 仅用于仪器不存在）
+    r = client.get(f"/api/trace/W?at={AT}")
+    assert r.status_code == 200
+    report = r.json()
+    assert report["resolution"] == "broken"
+    assert report["starts"] == []
+    assert "NO_ACTIVE_CERTIFICATE" in {c["code"] for c in report["conflicts"]}

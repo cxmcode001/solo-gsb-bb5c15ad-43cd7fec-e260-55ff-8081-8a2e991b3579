@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（93 个用例）
+pytest -q        # 运行测试（108 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -83,11 +83,21 @@ certificates（校准证书）
 trace_edges（父子溯源边）
     child_cert_id(FK) → parent_cert_id(FK)
     valid_from、valid_until（边本身的有效区间，缺省继承子证书区间）、note
+
+certificate_revisions（证书修订历史；与证书更新同一事务维护）
+    certificate_id(FK→certificates)、version（连续版本号，从 1 起）
+    instrument_code、cert_number、issued_at、valid_from、valid_until、
+    uncertainty、unit、digest_alg、signature_digest、signed_payload（完整快照）
+    recorded_at（版本记录时刻）
+    PRIMARY KEY (certificate_id, version)
 ```
 
 - 国家基准：`instruments.is_national_standard = true` 的仪器所持证书是溯源根节点，
   根节点不再向上溯源。
 - 同一子证书可挂多条父边，因此同一时点可能枚举出多条候选链。
+- 证书修订历史：首次按 ID 保存证书记录 v1；功能上线前已存在的存量证书首次更新前
+  先补录旧值为 v1；仅业务字段实际变化才追加连续版本，同内容重交不增版；
+  批量预检（dry-run）绝不留下版本。
 
 ```
 calibration_bookings（校准工位预约；全实验室单个工位，半开区间占用）
@@ -115,6 +125,8 @@ calibration_bookings（校准工位预约；全实验室单个工位，半开区
 | GET | `/api/instruments` · `/api/instruments/{code}` | 仪器列表/详情 |
 | POST | `/api/certificates` | 单个证书 upsert（未给摘要时服务端重算） |
 | GET | `/api/certificates?instrument_code=` | 证书列表 |
+| **GET** | **`/api/certificates/{id}/revisions`** | **证书修订历史：连续版本快照列表（首存 v1，业务字段变化才增版）** |
+| **GET** | **`/api/certificates/{id}/revisions/diff?from_version=&to_version=`** | **指定两版的字段差异（缺失版本 404）** |
 | POST | `/api/edges` | 溯源边 upsert（禁止自环、校验区间） |
 | GET | `/api/edges` | 溯源边列表 |
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
@@ -861,6 +873,83 @@ NaN/±Inf（非有限浮点）、缺 `target_unit`/`readings` 字段时返回 **
 （中文原因）；时间入参按 UTC 解释，建议统一用 `...Z` 格式，`at` 留空取
 服务端当前时间。
 
+### 8）证书修订历史（GET /api/certificates/{id}/revisions · /revisions/diff）
+
+单条证书接口（`POST /api/certificates`）与批量提交（`POST /api/submissions`）
+每次按 ID 写入证书时，在**同一事务**内维护可追查的连续版本历史：
+
+- **首次保存**：完整业务字段快照记为 **v1**；
+- **存量证书**（功能上线前已入库、尚无版本记录的证书）首次更新前，先把
+  **旧值补录为 v1**，再按新值判定是否追加；
+- **仅当业务字段实际变化**（`instrument_code / cert_number / issued_at /
+  valid_from / valid_until / uncertainty / unit / digest_alg /
+  signature_digest / signed_payload`）才追加连续版本 vN+1；
+  **同内容重交不增版**；
+- 版本写入与证书更新处于**同一事务**，任一步失败整体回滚，不会出现
+  “证书已改但版本缺失”的中间态；
+- 批量预检（`/api/submissions/preflight`）在独立事务中模拟并整体回滚，
+  **绝不留下版本**。
+
+```bash
+# ① 首次保存 -> v1
+curl -X POST http://localhost:8000/api/certificates \
+  -H 'Content-Type: application/json' -d '{
+    "id": "CW", "instrument_code": "W", "cert_number": "CAL-101",
+    "issued_at": "2026-01-10T00:00:00Z",
+    "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2027-01-01T00:00:00Z",
+    "uncertainty": 0.002, "unit": "mm"
+  }'
+
+# ② 修改不确定度 -> 追加 v2（同内容重交不会增版）
+curl -X POST http://localhost:8000/api/certificates \
+  -H 'Content-Type: application/json' -d '{
+    "id": "CW", "instrument_code": "W", "cert_number": "CAL-101",
+    "issued_at": "2026-01-10T00:00:00Z",
+    "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2027-01-01T00:00:00Z",
+    "uncertainty": 0.0015, "unit": "mm"
+  }'
+
+# ③ 按证书 ID 查询版本列表
+curl http://localhost:8000/api/certificates/CW/revisions
+
+# ④ 指定两版的字段差异
+curl "http://localhost:8000/api/certificates/CW/revisions/diff?from_version=1&to_version=2"
+```
+
+```jsonc
+// GET /api/certificates/CW/revisions
+{
+  "certificate_id": "CW",
+  "revision_count": 2,
+  "revisions": [
+    {"certificate_id": "CW", "version": 1, "cert_number": "CAL-101",
+     "uncertainty": 0.002, "unit": "mm", /* ...完整业务字段快照... */
+     "recorded_at": "2026-09-24T08:00:00Z"},
+    {"certificate_id": "CW", "version": 2, "cert_number": "CAL-101",
+     "uncertainty": 0.0015, "unit": "mm",
+     "recorded_at": "2026-09-24T09:00:00Z"}
+  ]
+}
+
+// GET /api/certificates/CW/revisions/diff?from_version=1&to_version=2
+// 载荷/摘要由业务字段重算，随 uncertainty 一并变化
+{
+  "certificate_id": "CW",
+  "from_version": 1,
+  "to_version": 2,
+  "changed_fields": ["uncertainty", "signature_digest", "signed_payload"],
+  "changes": {
+    "uncertainty": {"from": 0.002, "to": 0.0015},
+    "signature_digest": {"from": "9f86…", "to": "2c62…"},
+    "signed_payload": {"from": "{...}", "to": "{...}"}
+  }
+}
+```
+
+证书不存在返回 **404**；引用的版本号不存在同样返回 **404**
+（如 `证书 CW 不存在版本 3`，中文原因）。`from_version == to_version`
+时 `changed_fields` 为空、`changes` 为空对象。
+
 ---
 
 ## 六、内置演示场景
@@ -1036,6 +1125,12 @@ curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
     En 无定义，仅读数相等才相容）；再以 Bron–Kerbosch（带枢轴）枚举
     相容关系图的全部极大团，输出人数 ≥2 的极大两两相容分组（可重叠，
     按仪器编码稳定排序，不以连通分量代替）。全程不写入业务数据。
+11. 证书修订历史：单条证书接口与批量提交按 ID upsert 证书时，在同一事务
+    内维护 `certificate_revisions` 连续版本快照——首次写入记 v1；功能
+    上线前已存在的存量证书首次更新前先补录旧值为 v1；仅业务字段实际变化
+    才追加 vN+1，同内容重交不增版；任一步失败整体回滚。批量预检在独立
+    事务中模拟并回滚，绝不留下版本。版本列表与指定两版字段差异可按证书
+    ID 查询，引用不存在的证书或版本号返回 404。
 
 ## 八、项目结构
 
@@ -1044,7 +1139,7 @@ app/
   main.py            FastAPI 入口、路由注册、启动建库/播种
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
-  crud.py            upsert 与写入期校验
+  crud.py            upsert 与写入期校验、证书修订历史（连续版本快照）
   engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
                      批次共同溯源核查（共同证书选举 + 子链截取）、
@@ -1053,7 +1148,8 @@ app/
   booking.py         校准工位预约：单工位半开占用查询、最早空档贪心、
                      写事务内重查确认（409 冲突）与预约持久化/列表
   seed.py            五场景演示数据 + 1 条校准工位演示预约
-  routers/           instruments / certificates / edges /
+  routers/           instruments / certificates（含修订历史 revisions
+                     与两版差异 diff）/ edges /
                      submissions（批量提交 + preflight 预检）/
                      trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查
                      + 测量相容性评估) /
@@ -1066,5 +1162,6 @@ tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
 tests/test_common_trace.py   12 个批次共同溯源核查测试
 tests/test_measurement_compatibility.py  14 个测量相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
+tests/test_revisions.py      15 个证书修订历史测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```
